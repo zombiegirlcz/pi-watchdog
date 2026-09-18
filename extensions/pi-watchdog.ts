@@ -17,6 +17,10 @@
  *
  * Smyčka je omezená: pokud předchozí tah spustil watchdog (naše guidance),
  * další settle už jen zapíše "..." a nic nevolá.
+ *
+ * Pozn.: watchdog se aktivuje jen tam, kde je UI (TUI / RPC mód). V print
+ * režimu (`pi -p`) se přeskočí — po dokončení se session zavírá a není komu
+ * radit.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -40,6 +44,29 @@ import {
 } from "../lib/watchdog-core.ts";
 
 export * from "../lib/watchdog-core.ts";
+
+/** Data, která si vezmeme ze session SYNCHRONNĚ v momentě agent_settled.
+ *  Později už na ctx nesaháme — po reloadu/změně session je ctx "stale". */
+export interface SettledFacts {
+	hasUI: boolean;
+	sessionFile?: string;
+	entries: unknown[];
+}
+
+/** Synchronně vytáhne fakta ze session; když je ctx už nedostupný, vrátí null. */
+export function collectFacts(ctx: any): SettledFacts | null {
+	try {
+		const sm = ctx?.sessionManager;
+		if (!sm) return null;
+		return {
+			hasUI: !!ctx?.hasUI,
+			sessionFile: sm.getSessionFile?.() ?? undefined,
+			entries: sm.getEntries?.() ?? [],
+		};
+	} catch {
+		return null;
+	}
+}
 
 export default function (pi: ExtensionAPI) {
 	// Child pi (spouštěný watchdogem) démona nenačítá → žádná rekurze.
@@ -80,8 +107,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function generateGuidance(ctx: any): Promise<string | null> {
-		const sessionFile: string | undefined = ctx?.sessionManager?.getSessionFile?.();
+	async function generateGuidance(sessionFile: string | undefined): Promise<string | null> {
 		if (!sessionFile || !fs.existsSync(sessionFile)) return null;
 
 		const stamp = `${Date.now()}-${process.pid}`;
@@ -113,22 +139,18 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function fire(ctx: any) {
+	async function fire(facts: SettledFacts) {
 		if (running) return;
-		let entries: any[] = [];
-		try {
-			entries = ctx?.sessionManager?.getEntries?.() ?? [];
-		} catch {
-			entries = [];
-		}
+		if (!facts.hasUI) return;
+
 		const action = decide({
 			enabled: cfg.enabled,
 			mode: cfg.mode,
 			count,
 			max: cfg.max,
 			running,
-			isError: lastIsError(entries),
-			lastWasWatchdog: lastWasWatchdog(entries),
+			isError: lastIsError(facts.entries),
+			lastWasWatchdog: lastWasWatchdog(facts.entries),
 		});
 		if (action === "none") return;
 
@@ -139,7 +161,7 @@ export default function (pi: ExtensionAPI) {
 				sendDots();
 				return;
 			}
-			const guidance = await generateGuidance(ctx);
+			const guidance = await generateGuidance(facts.sessionFile);
 			if (guidance && guidance.trim() !== "...") {
 				sendGuidance(guidance.trim());
 			} else {
@@ -236,10 +258,12 @@ export default function (pi: ExtensionAPI) {
 
 	// ---- životní cyklus ---------------------------------------------------
 
-	// Agent doběhl a sám nebude pokračovat → rozhodni se (lehce odloženo)
+	// Agent doběhl a sám nebude pokračovat → vezmi fakta TEĎ a rozhodni se.
 	pi.on("agent_settled", async (_event, ctx) => {
+		const facts = collectFacts(ctx);
+		if (!facts) return; // ctx je nedostupný (reload / zavírání session)
 		setTimeout(() => {
-			void fire(ctx);
+			void fire(facts);
 		}, 150);
 	});
 
