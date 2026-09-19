@@ -49,6 +49,7 @@ import {
 	CONFIG_TYPE,
 	DEFAULT_CONFIG,
 	GUIDANCE_PROMPT,
+	MAX_EXPORT_CHARS,
 	MODEL_CHOICES,
 	PROMPTS_DIR_NAME,
 	buildChildCommand,
@@ -61,6 +62,8 @@ import {
 	pickSkillDirs,
 	sortModels,
 	stripFrontmatter,
+	tailByChars,
+	isShimError,
 	type PromptSkill,
 	type WatchdogConfig,
 	type WatchdogMode,
@@ -223,7 +226,10 @@ export default function (pi: ExtensionAPI) {
 		const exportPath = path.join(os.tmpdir(), `watchdog-${stamp}.jsonl`);
 		const promptPath = path.join(os.tmpdir(), `watchdog-${stamp}.prompt.txt`);
 		try {
-			fs.copyFileSync(sessionFile, exportPath);
+			// Exportujeme jen ohraničený ocas session (celá session by přetekla
+			// limit shimu → child by vrátil "Dosažen limit délky").
+			const raw = fs.readFileSync(sessionFile, "utf-8");
+			fs.writeFileSync(exportPath, tailByChars(raw, MAX_EXPORT_CHARS), "utf-8");
 			fs.writeFileSync(promptPath, promptText, "utf-8");
 		} catch {
 			cleanup(exportPath);
@@ -239,7 +245,9 @@ export default function (pi: ExtensionAPI) {
 			);
 			if (res?.code !== 0) return null;
 			const out = String(res?.stdout ?? "").trim();
-			return out.length > 0 ? out : null;
+			// Chybová zpráva shimu není nasměrování → ber jako selhání.
+			if (out.length === 0 || isShimError(out)) return null;
+			return out;
 		} catch {
 			return null;
 		} finally {

@@ -10,6 +10,13 @@ export const CONFIG_TYPE = "pi-watchdog-config";
 /** Název složky v balíčku, kde žijí uživatelské prompty (formát skillu). */
 export const PROMPTS_DIR_NAME = "prompts";
 
+/**
+ * Maximální velikost exportu session (ve znacích), který se posílá child pi.
+ * Musí zůstat pod limitem shimu (~400000 znaků), jinak child vrátí
+ * "Dosažen limit délky" a watchdog spadne na "...".
+ */
+export const MAX_EXPORT_CHARS = 200000;
+
 export const GUIDANCE_PROMPT = [
 	"Jsi watchdog, který právě čte session log jiného agenta (pi).",
 	"Agent dokončil práci nebo čeká na další směr. Tvým úkolem je nasměrovat ho správným směrem.",
@@ -213,6 +220,47 @@ export function pickSkillDirs(entries: readonly string[]): string[] {
 export function choosePromptText(builtin: string, customBody: string | null | undefined): string {
 	const body = (customBody ?? "").trim();
 	return body.length > 0 ? body : builtin;
+}
+
+/**
+ * Vrátí ocas textu (po celých řádcích) tak, aby se vešel do `maxChars`.
+ * Bere řádky od konce; obří řádky (např. výstup toolu) přeskočí, aby se
+ * do limitu vešlo co nejvíc relevantních (posledních) zpráv.
+ * Vždy končí `\n`, když něco vrátí.
+ */
+export function tailByChars(text: string, maxChars: number): string {
+	if (!text) return "";
+	const lines = text.split("\n");
+	const taken: string[] = [];
+	let size = 0;
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const line = lines[i];
+		const lineSize = line.length + 1; // +1 za \n
+		// prázdné řádky na konci přeskoč
+		if (line.trim() === "" && taken.length === 0) continue;
+		if (size + lineSize > maxChars) {
+			// obří řádek přeskoč a zkus menší starší
+			continue;
+		}
+		taken.push(line);
+		size += lineSize;
+	}
+	if (taken.length === 0) return "";
+	return taken.reverse().join("\n") + "\n";
+}
+
+/**
+ * Rozpozná, že výstup z child pi není skutečné nasměrování, ale chybová
+ * zpráva shimu (limit délky / prázdná odpověď). Takovou zprávu neposílat
+ * jako guidance.
+ */
+export function isShimError(text: string): boolean {
+	const t = (text ?? "").trim();
+	if (t === "") return false;
+	if (/CHYBA SHIMU/i.test(t)) return true;
+	if (/Dosažen limit délky/i.test(t)) return true;
+	if (/prazdna odpoved|prázdná odpověď/i.test(t)) return true;
+	return false;
 }
 
 /**

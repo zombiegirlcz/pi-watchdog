@@ -18,6 +18,9 @@ import {
 	formatModelValue,
 	sortModels,
 	groupModelsByProvider,
+	tailByChars,
+	isShimError,
+	MAX_EXPORT_CHARS,
 } from "../lib/watchdog-core.ts";
 
 const msg = (message) => ({ type: "message", message });
@@ -256,4 +259,48 @@ test("groupModelsByProvider: seskupí a seřadí", () => {
 		groups[0].models.map((m) => m.id),
 		["1", "2"],
 	);
+});
+
+// ---- nové: ohraničení exportu + detekce shim chyby ------------------------
+
+test("tailByChars: krátký text vrátí celý", () => {
+	assert.equal(tailByChars("a\nb\nc", 100), "a\nb\nc\n");
+});
+
+test("tailByChars: drží se od konce a jen celé řádky", () => {
+	const out = tailByChars("aaaa\nbbbb\ncccc", 10);
+	assert.equal(out, "bbbb\ncccc\n");
+});
+
+test("tailByChars: přeskočí obří řádek (tool output) a vezme menší starší", () => {
+	const big = "x".repeat(1000);
+	const out = tailByChars(`maly1\n${big}\nmaly2`, 50);
+	assert.equal(out, "maly1\nmaly2\n");
+});
+
+test("tailByChars: prázdný vstup → prázdný výstup", () => {
+	assert.equal(tailByChars("", 100), "");
+	assert.equal(tailByChars("\n\n", 100), "");
+});
+
+test("MAX_EXPORT_CHARS je rozumný a menší než limit shimu", () => {
+	assert.ok(MAX_EXPORT_CHARS > 0);
+	assert.ok(MAX_EXPORT_CHARS <= 400000);
+});
+
+test("isShimError: rozpozná chybu shimu (limit délky)", () => {
+	assert.equal(
+		isShimError("[CHYBA SHIMU: chat/completion: Dosažen limit délky. Začněte nový chat. — není to odpověď modelu]"),
+		true,
+	);
+});
+
+test("isShimError: rozpozná prázdnou odpověď", () => {
+	assert.equal(isShimError("[chyba: chat/completion: prazdna odpoved (zadne data:)]"), true);
+});
+
+test("isShimError: normální guidance není chyba", () => {
+	assert.equal(isShimError("Dokonči testy a pak commitni."), false);
+	assert.equal(isShimError("..."), false);
+	assert.equal(isShimError(""), false);
 });

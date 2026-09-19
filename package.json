@@ -1,6 +1,6 @@
 {
   "name": "pi-watchdog",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Watchdog daemon for pi - when the agent settles, either pokes it with '...' or asks a child pi to read the session and steer it with concrete, safety-aware guidance.",
   "keywords": ["pi-package", "watchdog", "daemon", "agent", "automation"],
   "type": "module",
