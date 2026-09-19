@@ -7,6 +7,9 @@
 export const CHILD_ENV = "PI_WATCHDOG_CHILD";
 export const CONFIG_TYPE = "pi-watchdog-config";
 
+/** Název složky v balíčku, kde žijí uživatelské prompty (formát skillu). */
+export const PROMPTS_DIR_NAME = "prompts";
+
 export const GUIDANCE_PROMPT = [
 	"Jsi watchdog, který právě čte session log jiného agenta (pi).",
 	"Agent dokončil práci nebo čeká na další směr. Tvým úkolem je nasměrovat ho správným směrem.",
@@ -29,6 +32,8 @@ export interface WatchdogConfig {
 	mode: WatchdogMode;
 	model: string;
 	max: number;
+	/** Název zvoleného prompt-skills z `prompts/`. Prázdné = vestavěný GUIDANCE_PROMPT. */
+	prompt: string;
 }
 
 export const DEFAULT_CONFIG: WatchdogConfig = {
@@ -36,8 +41,10 @@ export const DEFAULT_CONFIG: WatchdogConfig = {
 	mode: "smart",
 	model: "deepseek-free/deepseek-reasoner",
 	max: 20,
+	prompt: "",
 };
 
+/** Záložní seznam, když se modely nepodaří načíst z pi (mirror se plní za běhu). */
 export const MODEL_CHOICES = [
 	"deepseek-free/deepseek-reasoner",
 	"deepseek-free/deepseek-chat",
@@ -136,4 +143,106 @@ export function loadConfigFromEntries(entries: readonly unknown[]): WatchdogConf
 		}
 	}
 	return cfg;
+}
+
+// ---------------------------------------------------------------------------
+// Prompt skills (formát skillu: <prompts>/<nazev>/SKILL.md s frontmatter)
+// ---------------------------------------------------------------------------
+
+export interface PromptSkill {
+	/** Název složky (slug). */
+	dir: string;
+	/** `name` z frontmatteru (fallback = dir). */
+	name: string;
+	description: string;
+	/** Absolutní cesta k SKILL.md. */
+	path: string;
+}
+
+export interface SkillFrontmatter {
+	name?: string;
+	description?: string;
+}
+
+/**
+ * Vyparsuje YAML frontmatter (mezi prvními dvěma `---`) ze SKILL.md.
+ * Záměrně jednoduché — čte jen skalární `name:` a `description:`.
+ */
+export function parseSkillFrontmatter(text: string): SkillFrontmatter {
+	const out: SkillFrontmatter = {};
+	const norm = text.replace(/\r\n/g, "\n");
+	if (!norm.startsWith("---")) return out;
+	const end = norm.indexOf("\n---", 3);
+	if (end === -1) return out;
+	const block = norm.slice(3, end);
+	for (const rawLine of block.split("\n")) {
+		const line = rawLine.trim();
+		const m = /^(name|description)\s*:\s*(.*)$/.exec(line);
+		if (!m) continue;
+		let value = m[2].trim();
+		if (
+			(value.startsWith('"') && value.endsWith('"')) ||
+			(value.startsWith("'") && value.endsWith("'"))
+		) {
+			value = value.slice(1, -1);
+		}
+		if (m[1] === "name") out.name = value;
+		else out.description = value;
+	}
+	return out;
+}
+
+/** Vrátí tělo SKILL.md bez frontmatteru (to, co se posílá jako prompt). */
+export function stripFrontmatter(text: string): string {
+	const norm = text.replace(/\r\n/g, "\n");
+	if (!norm.startsWith("---")) return norm.trim();
+	const end = norm.indexOf("\n---", 3);
+	if (end === -1) return norm.trim();
+	return norm.slice(end + 4).replace(/^\n+/, "").trim();
+}
+
+/**
+ * Ze seznamu souborů (výstup fs.readdirSync) vybere ty, které vypadají jako
+ * prompt-skill: `<dir>/SKILL.md`. Čistě kvůli testovatelnosti bez fs.
+ */
+export function pickSkillDirs(entries: readonly string[]): string[] {
+	return entries.filter((name) => !name.startsWith(".")).sort();
+}
+
+/** Text, který se zapíše do prompt souboru pro child pi. */
+export function choosePromptText(builtin: string, customBody: string | null | undefined): string {
+	const body = (customBody ?? "").trim();
+	return body.length > 0 ? body : builtin;
+}
+
+/**
+ * Popisek modelu pro picker — přesně to, co pi bere pro `--model`
+ * (`provider/id`). Mirro pi modelů se plní z `ctx.modelRegistry`.
+ */
+export function formatModelValue(model: { provider?: string; id: string }): string {
+	return `${model.provider ?? "?"}/${model.id}`;
+}
+
+/** Seřadí modely jako pi: nejdřív podle providera, pak podle id. */
+export function sortModels<T extends { provider?: string; id: string }>(models: readonly T[]): T[] {
+	return [...models].sort((a, b) => {
+		const pa = a.provider ?? "";
+		const pb = b.provider ?? "";
+		if (pa !== pb) return pa < pb ? -1 : 1;
+		return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+	});
+}
+
+/** Seskupí modely podle providera (pro vykreslení do sloupců/skupin). */
+export function groupModelsByProvider<T extends { provider?: string; id: string }>(
+	models: readonly T[],
+): Array<{ provider: string; models: T[] }> {
+	const map = new Map<string, T[]>();
+	for (const m of sortModels(models)) {
+		const p = m.provider ?? "?";
+		const arr = map.get(p);
+		if (arr) arr.push(m);
+		else map.set(p, [m]);
+	}
+	return [...map.entries()].map(([provider, list]) => ({ provider, models: list }));
 }

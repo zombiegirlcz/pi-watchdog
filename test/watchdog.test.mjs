@@ -11,6 +11,13 @@ import {
 	MODEL_CHOICES,
 	loadConfigFromEntries,
 	CONFIG_TYPE,
+	parseSkillFrontmatter,
+	stripFrontmatter,
+	pickSkillDirs,
+	choosePromptText,
+	formatModelValue,
+	sortModels,
+	groupModelsByProvider,
 } from "../lib/watchdog-core.ts";
 
 const msg = (message) => ({ type: "message", message });
@@ -167,4 +174,86 @@ test("loadConfigFromEntries: poslední config vyhrává a merguje se", () => {
 	assert.equal(cfg.mode, "simple");
 	assert.equal(cfg.max, 5);
 	assert.equal(cfg.model, DEFAULT_CONFIG.model);
+});
+
+// ---- nové: prompt skills + mirror modelů -----------------------------------
+
+test("DEFAULT_CONFIG má prompt = prázdný (vestavěný prompt)", () => {
+	assert.equal(DEFAULT_CONFIG.prompt, "");
+});
+
+test("loadConfigFromEntries: umí načíst volbu promptu", () => {
+	const cfg = loadConfigFromEntries([cfgEntry({ prompt: "kali-audit" })]);
+	assert.equal(cfg.prompt, "kali-audit");
+});
+
+test("parseSkillFrontmatter: name + description ze SKILL.md", () => {
+	const fm = parseSkillFrontmatter(
+		["---", "name: kali-audit", "description: Hlídá bezpečnostní audit", "---", "", "Tělo"].join(
+			"\n",
+		),
+	);
+	assert.equal(fm.name, "kali-audit");
+	assert.equal(fm.description, "Hlídá bezpečnostní audit");
+});
+
+test("parseSkillFrontmatter: uvozovky se odstraní", () => {
+	const fm = parseSkillFrontmatter('---\nname: "x"\ndescription: \'y z\'\n---\n');
+	assert.equal(fm.name, "x");
+	assert.equal(fm.description, "y z");
+});
+
+test("parseSkillFrontmatter: bez frontmatteru vrátí prázdno", () => {
+	assert.deepEqual(parseSkillFrontmatter("# Jen nadpis"), {});
+});
+
+test("stripFrontmatter: vrátí jen tělo bez --- bloku", () => {
+	const body = stripFrontmatter("---\nname: a\ndescription: b\n---\n\nTělo promptu\nřádek 2");
+	assert.equal(body, "Tělo promptu\nřádek 2");
+});
+
+test("stripFrontmatter: bez frontmatteru vrátí ořezaný text", () => {
+	assert.equal(stripFrontmatter("\n  Tělo  \n"), "Tělo");
+});
+
+test("pickSkillDirs: vyhodí skryté a seřadí", () => {
+	assert.deepEqual(pickSkillDirs(["b", "a", ".git", ".DS_Store"]), ["a", "b"]);
+});
+
+test("choosePromptText: custom tělo vyhraje, jinak vestavěný", () => {
+	assert.equal(choosePromptText("BUILTIN", "  vlastni  "), "vlastni");
+	assert.equal(choosePromptText("BUILTIN", ""), "BUILTIN");
+	assert.equal(choosePromptText("BUILTIN", null), "BUILTIN");
+});
+
+test("formatModelValue: provider/id", () => {
+	assert.equal(formatModelValue({ provider: "deepseek-free", id: "deepseek-reasoner" }), "deepseek-free/deepseek-reasoner");
+});
+
+test("sortModels: podle providera pak id", () => {
+	const sorted = sortModels([
+		{ provider: "b", id: "x" },
+		{ provider: "a", id: "z" },
+		{ provider: "a", id: "a" },
+	]);
+	assert.deepEqual(
+		sorted.map((m) => `${m.provider}/${m.id}`),
+		["a/a", "a/z", "b/x"],
+	);
+});
+
+test("groupModelsByProvider: seskupí a seřadí", () => {
+	const groups = groupModelsByProvider([
+		{ provider: "b", id: "1" },
+		{ provider: "a", id: "2" },
+		{ provider: "a", id: "1" },
+	]);
+	assert.deepEqual(
+		groups.map((g) => g.provider),
+		["a", "b"],
+	);
+	assert.deepEqual(
+		groups[0].models.map((m) => m.id),
+		["1", "2"],
+	);
 });

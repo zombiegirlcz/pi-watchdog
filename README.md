@@ -24,17 +24,63 @@ Po každém `agent_settled` (agent doběhl a sám nebude pokračovat) watchdog r
 
 ## Nastavení — `/watchdog`
 
-Příkaz `/watchdog` otevře overlay okno (SettingsList), kde se nastavuje:
+Příkaz `/watchdog` otevře overlay okno, rozdělené na dva panely:
 
-| Položka | Hodnoty |
+```
+┌─ Modely (mirror pi) ──────────┐ │ ┌─ Prompty ── Nastavení ────────┐
+│ ▸ deepseek-reasoner           │ │ │  (vestavěný prompt)            │
+│   deepseek-chat               │ │ │  security-audit                │
+│   qwen3-coder                 │ │ │  ...                           │
+│   …všechny modely, které pi   │ │ │                                │
+│   zná (provider/id)           │ │ │                                │
+└───────────────────────────────┘ │ └────────────────────────────────┘
+   ←→ panel • Tab záložka • ↑↓ výběr • Enter potvrdit • Esc zavřít
+```
+
+| Panel | Obsah |
 |---|---|
-| Watchdog | on / off |
-| Režim | smart / simple |
-| Model pro směrování | `deepseek-free/deepseek-reasoner`, `deepseek-free/deepseek-chat`, `qwen-free/qwen3-coder` |
-| Max. počet zásahů | 0 (∞), 3, 5, 10, 20, 50 |
+| **Vlevo** | Mirror pi modelů — úplně stejný seznam, jaký zná pi (`ctx.modelRegistry`). Enter nastaví model pro směrování. |
+| **Vpravo / Prompty** | Uživatelské prompty ze složky [`prompts/`](#vlastní-prompty). Enter vybere prompt pro child `pi`. |
+| **Vpravo / Nastavení** | on/off, režim (smart/simple), max. počet zásahů. |
 
-Nastavení se ukládá do session (`pi-watchdog-config` entry) a přežije reload/resume.
+Tab přepíná záložky v pravém panelu, `←`/`→` přepíná fokus mezi panely.
+
+Nastavení (včetně zvoleného modelu a promptu) se ukládá do session
+(`pi-watchdog-config` entry) a přežije reload/resume.
 Stav je vidět v patičce jako `🐕 watchdog`.
+
+## Vlastní prompty
+
+Složka `prompts/` obsahuje uživatelské prompty ve **formátu skillu** — každý prompt je
+složka s `SKILL.md`:
+
+```
+prompts/
+└── security-audit/
+    └── SKILL.md
+```
+
+`SKILL.md` má YAML frontmatter a tělo, které se pošle child `pi` jako systémový prompt:
+
+```markdown
+---
+name: security-audit
+description: Hlídá bezpečnostní a destruktivní operace — použij, když projekt pracuje s rootem, mounty nebo produkčními daty.
+---
+
+Jsi watchdog, který čte session log jiného agenta (pi)…
+
+Pravidla:
+- Než něco doporučíš, ověř si stav nástroji (read, bash) — netvrď naslepo.
+- …
+```
+
+- `name` a `description` se zobrazí v záložce **Prompty** v `/watchdog`.
+- Tělo (bez frontmatteru) se použije jako prompt pro child `pi`.
+- Když není vybrán žádný vlastní prompt, použije se vestavěný `GUIDANCE_PROMPT`.
+- Formát je kompatibilní se [Agent Skills standardem](https://agentskills.io/specification).
+
+Přidání dalšího promptu = vytvořit `prompts/<nazev>/SKILL.md` a dát `/reload`.
 
 ## Jak funguje chytré směrování
 
@@ -49,7 +95,7 @@ PI_WATCHDOG_CHILD=1 pi -p "$(cat /tmp/watchdog-*.prompt.txt)" \
 - `--no-session` → child session se neukládá.
 - Export session se po použití smaže.
 
-Watchdog prompt (mini prompt pro child `pi`) říká:
+Vestavěný watchdog prompt říká:
 - jsi watchdog, čteš session log jiného agenta
 - než něco doporučíš, **můžeš si stav ověřit** (read, bash) — ověřuj, netvrď naslepo
 - vyber pro daný cíl a kontext **nejužitečnější** další krok
@@ -65,13 +111,14 @@ Watchdog prompt (mini prompt pro child `pi`) říká:
 ## Vývoj
 
 ```bash
-npm test        # 23 testů (čistá logika v lib/watchdog-core.ts)
+npm test        # 35 testů (čistá logika v lib/watchdog-core.ts)
 ```
 
 Struktura:
-- `extensions/pi-watchdog.ts` — démon + `/watchdog` okno
-- `lib/watchdog-core.ts` — čistá, testovatelná logika (decide, lastIsError, lastWasWatchdog, buildChildCommand, …)
+- `extensions/pi-watchdog.ts` — démon + `/watchdog` okno (dva panely + záložky)
+- `lib/watchdog-core.ts` — čistá, testovatelná logika (decide, lastIsError, lastWasWatchdog, buildChildCommand, parsování prompt-skills, model picker, …)
 - `test/watchdog.test.mjs` — node:test sada
+- `prompts/` — uživatelské prompty ve formátu skillu
 
 ## Licence
 
