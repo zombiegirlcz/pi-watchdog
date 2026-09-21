@@ -3,3 +3,4 @@ node_modules/
 .DS_Store
 session.jsonl
 .pi/
+prompts/*/.pi/

@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	decide,
 	lastIsError,
@@ -24,6 +27,8 @@ import {
 	tailByChars,
 	isShimError,
 	MAX_EXPORT_CHARS,
+	loadPromptSkills,
+	readPromptBody,
 	TASK_COMPLETE_TYPE,
 	NUDGE_TYPE,
 	GUIDANCE_TYPE,
@@ -357,4 +362,104 @@ test("isShimError: normální guidance není chyba", () => {
 	assert.equal(isShimError("Dokonči testy a pak commitni."), false);
 	assert.equal(isShimError("..."), false);
 	assert.equal(isShimError(""), false);
+});
+
+// ---- nové: ověření přepínání reálných promptů ---------------------------
+
+test("reálné prompty: každý skill vrací své tělo, ne GUIDANCE_PROMPT", () => {
+	const promptsDir = path.join(
+		path.dirname(fileURLToPath(import.meta.url)),
+		"..",
+		"prompts",
+	);
+	if (!fs.existsSync(promptsDir)) {
+		// skip if no prompts dir
+		return;
+	}
+
+	const skillDirs = pickSkillDirs(fs.readdirSync(promptsDir));
+	assert.ok(skillDirs.length > 0, "měl by existovat alespoň jeden skill v prompts/");
+
+	for (const dir of skillDirs) {
+		const skillPath = path.join(promptsDir, dir, "SKILL.md");
+		if (!fs.existsSync(skillPath)) continue;
+
+		const text = fs.readFileSync(skillPath, "utf-8");
+		const body = stripFrontmatter(text);
+		const result = choosePromptText(GUIDANCE_PROMPT, body);
+
+		assert.ok(
+			body.length > 0,
+			`skill '${dir}' by měl mít neprázdné tělo po stripFrontmatter`,
+		);
+
+		assert.ok(
+			result !== GUIDANCE_PROMPT,
+			`skill '${dir}' by měl vracet své tělo, ne GUIDANCE_PROMPT (tělo má ${body.length} znaků)`,
+		);
+
+		assert.equal(
+			result,
+			body,
+			`skill '${dir}' by měl vracet přesně své tělo`,
+		);
+	}
+});
+
+test("přepínání promptů: cfg.prompt='elf' a 'security-audit' vrací různá těla", () => {
+	const promptsDir = path.join(
+		path.dirname(fileURLToPath(import.meta.url)),
+		"..",
+		"prompts",
+	);
+	if (!fs.existsSync(promptsDir)) {
+		// skip if no prompts dir
+		return;
+	}
+
+	const skills = loadPromptSkills(promptsDir);
+	assert.ok(skills.length >= 2, "měly by existovat alespoň 2 skilly pro test přepínání");
+
+	const elfBody = readPromptBody(skills, "elf");
+	const securityBody = readPromptBody(skills, "security-audit");
+
+	assert.ok(elfBody, "elf by měl mít tělo (readPromptBody nevrátil null)");
+	assert.ok(securityBody, "security-audit by měl mít tělo (readPromptBody nevrátil null)");
+
+	assert.ok(elfBody.length > 0, "elf by měl mít neprázdné tělo");
+	assert.ok(securityBody.length > 0, "security-audit by měl mít neprázdné tělo");
+
+	// Ověření, že výstupem je právě tělo skillu (ne GUIDANCE_PROMPT)
+	assert.notEqual(
+		elfBody,
+		GUIDANCE_PROMPT,
+		"elf nesmí vracet GUIDANCE_PROMPT (měl by vracet své vlastní tělo)",
+	);
+	assert.notEqual(
+		securityBody,
+		GUIDANCE_PROMPT,
+		"security-audit nesmí vracet GUIDANCE_PROMPT (měl by vracet své vlastní tělo)",
+	);
+
+	// Ověření, že se prompty liší navzájem
+	assert.notEqual(
+		elfBody,
+		securityBody,
+		"elf a security-audit musí vracet různá těla (přepínání musí fungovat)",
+	);
+
+	// Ověření, že choosePromptText vrací tělo skillu (ne fallback na builtin)
+	const elfResult = choosePromptText(GUIDANCE_PROMPT, elfBody);
+	const securityResult = choosePromptText(GUIDANCE_PROMPT, securityBody);
+
+	assert.equal(
+		elfResult,
+		elfBody,
+		"choosePromptText by měl vracet elf tělo, ne GUIDANCE_PROMPT",
+	);
+	assert.equal(
+		securityResult,
+		securityBody,
+		"choosePromptText by měl vracet security-audit tělo, ne GUIDANCE_PROMPT",
+	);
 });
