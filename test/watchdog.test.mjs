@@ -7,6 +7,9 @@ import {
 	decide,
 	lastIsError,
 	lastWasWatchdog,
+	taskCompleted,
+	formatTimeout,
+	parseTimeout,
 	buildChildCommand,
 	shellQuote,
 	GUIDANCE_PROMPT,
@@ -26,6 +29,9 @@ import {
 	MAX_EXPORT_CHARS,
 	loadPromptSkills,
 	readPromptBody,
+	TASK_COMPLETE_TYPE,
+	NUDGE_TYPE,
+	GUIDANCE_TYPE,
 } from "../lib/watchdog-core.ts";
 
 const msg = (message) => ({ type: "message", message });
@@ -67,7 +73,56 @@ test("lastIsError: vlastní zprávy se přeskakují", () => {
 });
 
 test("lastWasWatchdog: naše guidance = true", () => {
-	assert.equal(lastWasWatchdog([msg({ role: "custom", customType: "pi-watchdog-guidance" })]), true);
+	assert.equal(lastWasWatchdog([msg({ role: "custom", customType: GUIDANCE_TYPE })]), true);
+});
+
+test("lastWasWatchdog: náš nudge = true", () => {
+	assert.equal(lastWasWatchdog([msg({ role: "custom", customType: NUDGE_TYPE })]), true);
+});
+
+test("lastWasWatchdog: agent po našem zásahu odpověděl → false", () => {
+	assert.equal(
+		lastWasWatchdog([
+			msg({ role: "custom", customType: NUDGE_TYPE }),
+			msg({ role: "assistant", stopReason: "stop" }),
+		]),
+		false,
+	);
+});
+
+test("taskCompleted: prázdná session → false", () => {
+	assert.equal(taskCompleted([]), false);
+});
+
+test("taskCompleted: custom entry task_complete → true", () => {
+	assert.equal(
+		taskCompleted([
+			msg({ role: "assistant", stopReason: "stop" }),
+			{ type: "custom", customType: TASK_COMPLETE_TYPE, data: { at: 1 } },
+		]),
+		true,
+	);
+});
+
+test("taskCompleted: nové uživatelské zadání po task_complete → false", () => {
+	assert.equal(
+		taskCompleted([
+			{ type: "custom", customType: TASK_COMPLETE_TYPE, data: {} },
+			msg({ role: "user" }),
+		]),
+		false,
+	);
+});
+
+test("taskCompleted: toolResult task_complete (bez entry) → true", () => {
+	assert.equal(
+		taskCompleted([msg({ role: "toolResult", toolName: "task_complete", isError: false })]),
+		true,
+	);
+	assert.equal(
+		taskCompleted([msg({ role: "toolResult", toolName: "task_complete", isError: true })]),
+		false,
+	);
 });
 
 test("lastWasWatchdog: skutečný uživatel po naší guidance = false", () => {
@@ -81,60 +136,58 @@ test("lastWasWatchdog: skutečný uživatel po naší guidance = false", () => {
 	);
 });
 
-test("decide: chyba → jen dots (žádné volání LLM)", () => {
-	assert.equal(
-		decide({ enabled: true, mode: "smart", count: 0, max: 20, running: false, isError: true, lastWasWatchdog: false }),
-		"dots",
-	);
+const base = { enabled: true, mode: "smart", count: 0, max: 20, running: false, isError: false, lastWasWatchdog: false, taskComplete: false };
+
+test("decide: chyba → nudge (nový request na API)", () => {
+	assert.equal(decide({ ...base, isError: true }), "nudge");
 });
 
 test("decide: dokončená práce → guidance", () => {
-	assert.equal(
-		decide({ enabled: true, mode: "smart", count: 0, max: 20, running: false, isError: false, lastWasWatchdog: false }),
-		"guidance",
-	);
+	assert.equal(decide(base), "guidance");
 });
 
-test("decide: předchozí tah byl watchdog → dots (ochrana proti smyčce)", () => {
-	assert.equal(
-		decide({ enabled: true, mode: "smart", count: 1, max: 20, running: false, isError: false, lastWasWatchdog: true }),
-		"dots",
-	);
+test("decide: předchozí tah byl watchdog → nudge (nový request, ne smyčka)", () => {
+	assert.equal(decide({ ...base, count: 1, lastWasWatchdog: true }), "nudge");
+});
+
+test("decide: task_complete → none (hlídání ukončeno)", () => {
+	assert.equal(decide({ ...base, taskComplete: true }), "none");
 });
 
 test("decide: enabled=false → none", () => {
-	assert.equal(
-		decide({ enabled: false, mode: "smart", count: 0, max: 20, running: false, isError: false, lastWasWatchdog: false }),
-		"none",
-	);
+	assert.equal(decide({ ...base, enabled: false }), "none");
 });
 
-test("decide: mode=simple → dots", () => {
-	assert.equal(
-		decide({ enabled: true, mode: "simple", count: 0, max: 20, running: false, isError: false, lastWasWatchdog: false }),
-		"dots",
-	);
+test("decide: mode=simple → nudge", () => {
+	assert.equal(decide({ ...base, mode: "simple" }), "nudge");
 });
 
 test("decide: running → none", () => {
-	assert.equal(
-		decide({ enabled: true, mode: "smart", count: 0, max: 20, running: true, isError: false, lastWasWatchdog: false }),
-		"none",
-	);
+	assert.equal(decide({ ...base, running: true }), "none");
 });
 
 test("decide: max dosažen → none", () => {
-	assert.equal(
-		decide({ enabled: true, mode: "smart", count: 20, max: 20, running: false, isError: false, lastWasWatchdog: false }),
-		"none",
-	);
+	assert.equal(decide({ ...base, count: 20, max: 20 }), "none");
 });
 
 test("decide: max=0 = bez limitu → guidance i při vysokém countu", () => {
-	assert.equal(
-		decide({ enabled: true, mode: "smart", count: 999, max: 0, running: false, isError: false, lastWasWatchdog: false }),
-		"guidance",
-	);
+	assert.equal(decide({ ...base, count: 999, max: 0 }), "guidance");
+});
+
+test("formatTimeout: 0 = bez limitu, jinak sekundy", () => {
+	assert.equal(formatTimeout(0), "0 (bez limitu)");
+	assert.equal(formatTimeout(180000), "180s");
+	assert.equal(formatTimeout(60000), "60s");
+});
+
+test("parseTimeout: zpět z popisku na ms", () => {
+	assert.equal(parseTimeout("180s"), 180000);
+	assert.equal(parseTimeout("60s"), 60000);
+	assert.equal(parseTimeout("0 (bez limitu)"), 0);
+});
+
+test("parseTimeout: nesmysl → výchozí timeout", () => {
+	assert.equal(parseTimeout("blbost"), DEFAULT_CONFIG.timeout);
 });
 
 test("shellQuote: bezpečně zacituje uvozovky", () => {
@@ -166,6 +219,7 @@ test("DEFAULT_CONFIG je rozumný", () => {
 	assert.equal(DEFAULT_CONFIG.enabled, true);
 	assert.equal(DEFAULT_CONFIG.mode, "smart");
 	assert.equal(DEFAULT_CONFIG.max, 20);
+	assert.equal(DEFAULT_CONFIG.timeout, 180000);
 	assert.ok(MODEL_CHOICES.includes(DEFAULT_CONFIG.model));
 });
 

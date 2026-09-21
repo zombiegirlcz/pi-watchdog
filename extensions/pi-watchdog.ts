@@ -3,8 +3,13 @@
  *
  * Kdykoli se agent usadí (agent_settled), vyhodnotí stav:
  *
- *   • poslední zpráva je CHYBA (error / aborted / toolResult.isError)
- *       → jen zapíše "..." do chatu. LLM se nevolá.
+ *   • agent zavolal `task_complete`  → práce je 100% hotová, watchdog mlčí.
+ *
+ *   • poslední zpráva je CHYBA (error / aborted / toolResult.isError),
+ *     nebo agent na předchozí zásah nereagoval
+ *       → pošle "nudge" (krátkou zprávu s triggerTurn:true). Tím se znovu
+ *         pošle request na API se stávajícím kontextem — to je ta "šťouchnutí",
+ *         na které agent skutečně zareaguje (na rozdíl od pouhého zápisu "...").
  *
  *   • poslední zpráva je DOKONČENÁ PRÁCE / čekání na směr
  *       → vyexportuje aktuální session do /tmp/watchdog-*.jsonl,
@@ -12,21 +17,19 @@
  *         získá konkrétní nasměrování (child MÁ plné tools, takže si stav může ověřit),
  *         a předá ho agentovi jako zprávu s triggerTurn (probudí ho).
  *
+ * Všechna selhání child pi (timeout, nenulový exit, chyba shimu) se zapisují
+ * jako custom ENTRY (`pi.appendEntry`) — zobrazí se v chatu, ale NEposílají
+ * se do LLM kontextu (stejně jako to pi dělá u hlášky o rate limitu).
+ *
  * Nastavení se dělá v TUI: příkaz `/watchdog` otevře overlay okno:
  *   • VLEVO  — mirror pi modelů (všechny, které pi zná)
  *   • VPRAVO — Tab přepíná mezi záložkou „Prompty“ a „Nastavení“
  *              - Prompty: uživatelské prompt-skills z `prompts/<nazev>/SKILL.md`
- *              - Nastavení: on/off, režim, max. počet zásahů
+ *              - Nastavení: on/off, režim, max. počet zásahů, timeout kontroly
  *
- * Uživatelské prompty mají formát skillu (frontmatter `name` + `description`
- * a tělo, které se posílá child pi jako systémový prompt).
- *
- * Smyčka je omezená: pokud předchozí tah spustil watchdog (naše guidance),
- * další settle už jen zapíše "..." a nic nevolá.
- *
- * Pozn.: watchdog se aktivuje jen tam, kde je UI (TUI / RPC mód). V print
- * režimu (`pi -p`) se přeskočí — po dokončení se session zavírá a není komu
- * radit.
+ * Smyčka je omezená: pokud předchozí tah spustil watchdog a agent na něj
+ * zatím neodpověděl, další settle už jen "nudge" (nový request), ne další
+ * child pi. `task_complete` hlídání ukončí úplně.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -35,33 +38,47 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getSelectListTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import {
+	Box,
 	Key,
 	matchesKey,
 	SelectList,
+	Text,
 	type SelectItem,
 	type SettingItem,
 	SettingsList,
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import {
 	CHILD_ENV,
 	CONFIG_TYPE,
 	DEFAULT_CONFIG,
 	GUIDANCE_PROMPT,
+	GUIDANCE_TYPE,
+	LOG_TYPE,
 	MAX_EXPORT_CHARS,
 	MODEL_CHOICES,
+	NUDGE_TEXT,
+	NUDGE_TYPE,
 	PROMPTS_DIR_NAME,
+	TASK_COMPLETE_TYPE,
+	TIMEOUT_CHOICES,
 	buildChildCommand,
 	choosePromptText,
 	decide,
+	formatTimeout,
 	lastIsError,
 	lastWasWatchdog,
 	loadConfigFromEntries,
 	loadPromptSkills,
 	readPromptBody,
+	parseSkillFrontmatter,
+	parseTimeout,
+	pickSkillDirs,
 	sortModels,
 	tailByChars,
+	taskCompleted,
 	isShimError,
 	type PromptSkill,
 	type WatchdogConfig,
@@ -137,6 +154,13 @@ function listModels(ctx: any): ModelInfo[] {
 	}
 }
 
+/** Je nakonfigurovaný `--model` použitelný? Když ne, zkusíme první dostupný. */
+function resolveModel(cfgModel: string, models: ModelInfo[]): string | null {
+	if (models.length === 0) return cfgModel || null;
+	if (cfgModel && models.some((m) => `${m.provider}/${m.id}` === cfgModel)) return cfgModel;
+	return models.length > 0 ? `${models[0].provider}/${models[0].id}` : null;
+}
+
 export default function (pi: ExtensionAPI) {
 	// Child pi (spouštěný watchdogem) démona nenačítá → žádná rekurze.
 	if (process.env[CHILD_ENV] === "1") return;
@@ -149,22 +173,40 @@ export default function (pi: ExtensionAPI) {
 		pi.appendEntry(CONFIG_TYPE, { ...cfg });
 	}
 
-	function sendDots() {
+	/** Log do chatu, ale MIMO LLM kontext (custom entry). */
+	function log(level: "info" | "warn" | "error", text: string) {
 		try {
-			pi.sendMessage({ customType: "pi-watchdog", content: "...", display: true }, {});
+			pi.appendEntry(LOG_TYPE, { level, text, at: Date.now() });
 		} catch {
-			/* když ani tohle nejde, tiše pokračuj */
+			/* ignore */
+		}
+	}
+
+	/**
+	 * Nudge — znovu pošle request na API se stávajícím kontextem.
+	 * Na rozdíl od `...` (které se jen zapíše do chatu) tohle spustí nový
+	 * LLM turn (`triggerTurn: true`), takže agent skutečně zareaguje.
+	 */
+	function sendNudge() {
+		try {
+			pi.sendMessage(
+				{ customType: NUDGE_TYPE, content: NUDGE_TEXT, display: true },
+				{ triggerTurn: true, deliverAs: "steer" },
+			);
+		} catch (err) {
+			log("error", `nudge selhal: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	}
 
 	function sendGuidance(text: string) {
 		try {
 			pi.sendMessage(
-				{ customType: "pi-watchdog-guidance", content: text, display: true },
+				{ customType: GUIDANCE_TYPE, content: text, display: true },
 				{ triggerTurn: true, deliverAs: "followUp" },
 			);
-		} catch {
-			sendDots();
+		} catch (err) {
+			log("error", `guidance selhala: ${err instanceof Error ? err.message : String(err)}`);
+			sendNudge();
 		}
 	}
 
@@ -179,8 +221,20 @@ export default function (pi: ExtensionAPI) {
 	async function generateGuidance(
 		sessionFile: string | undefined,
 		promptText: string,
+		models: ModelInfo[],
 	): Promise<string | null> {
-		if (!sessionFile || !fs.existsSync(sessionFile)) return null;
+		if (!sessionFile || !fs.existsSync(sessionFile)) {
+			log("warn", "guidance: není session file");
+			return null;
+		}
+		const model = resolveModel(cfg.model, models);
+		if (!model) {
+			log("warn", "guidance: žádný použitelný model");
+			return null;
+		}
+		if (model !== cfg.model) {
+			log("warn", `guidance: model "${cfg.model}" není dostupný, používám "${model}"`);
+		}
 
 		const stamp = `${Date.now()}-${process.pid}`;
 		const exportPath = path.join(os.tmpdir(), `watchdog-${stamp}.jsonl`);
@@ -191,24 +245,40 @@ export default function (pi: ExtensionAPI) {
 			const raw = fs.readFileSync(sessionFile, "utf-8");
 			fs.writeFileSync(exportPath, tailByChars(raw, MAX_EXPORT_CHARS), "utf-8");
 			fs.writeFileSync(promptPath, promptText, "utf-8");
-		} catch {
+		} catch (err) {
+			log("error", `guidance: příprava souborů selhala: ${err instanceof Error ? err.message : String(err)}`);
 			cleanup(exportPath);
 			cleanup(promptPath);
 			return null;
 		}
 
+		const timeout = cfg.timeout > 0 ? cfg.timeout : undefined;
 		try {
 			const res = await (pi as any).exec(
 				"bash",
-				["-c", buildChildCommand({ promptPath, exportPath, model: cfg.model })],
-				{ timeout: 180000 },
+				["-c", buildChildCommand({ promptPath, exportPath, model })],
+				timeout ? { timeout } : {},
 			);
-			if (res?.code !== 0) return null;
+			if (res?.code !== 0) {
+				log(
+					"error",
+					`guidance: child pi skončil s kódem ${res?.code} (timeout=${formatTimeout(cfg.timeout)})`,
+				);
+				return null;
+			}
 			const out = String(res?.stdout ?? "").trim();
 			// Chybová zpráva shimu není nasměrování → ber jako selhání.
-			if (out.length === 0 || isShimError(out)) return null;
+			if (out.length === 0) {
+				log("warn", "guidance: child pi vrátil prázdný výstup");
+				return null;
+			}
+			if (isShimError(out)) {
+				log("error", `guidance: chyba shimu: ${out.slice(0, 200)}`);
+				return null;
+			}
 			return out;
-		} catch {
+		} catch (err) {
+			log("error", `guidance: child pi selhal: ${err instanceof Error ? err.message : String(err)}`);
 			return null;
 		} finally {
 			cleanup(exportPath);
@@ -216,7 +286,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function fire(facts: SettledFacts) {
+	async function fire(facts: SettledFacts, models: ModelInfo[]) {
 		if (running) return;
 		if (!facts.hasUI) return;
 
@@ -228,28 +298,80 @@ export default function (pi: ExtensionAPI) {
 			running,
 			isError: lastIsError(facts.entries),
 			lastWasWatchdog: lastWasWatchdog(facts.entries),
+			taskComplete: taskCompleted(facts.entries),
 		});
 		if (action === "none") return;
 
 		running = true;
 		count++;
 		try {
-			if (action === "dots") {
-				sendDots();
+			if (action === "nudge") {
+				sendNudge();
 				return;
 			}
 			const skills = loadPromptSkills(promptsDir());
 			const promptText = choosePromptText(GUIDANCE_PROMPT, readPromptBody(skills, cfg.prompt));
-			const guidance = await generateGuidance(facts.sessionFile, promptText);
+			const guidance = await generateGuidance(facts.sessionFile, promptText, models);
 			if (guidance && guidance.trim() !== "...") {
 				sendGuidance(guidance.trim());
 			} else {
-				sendDots();
+				sendNudge();
 			}
 		} finally {
 			running = false;
 		}
 	}
+
+	// ---- registrace rendererů a toolu -------------------------------------
+
+	// Log v chatu, ale mimo LLM kontext.
+	pi.registerEntryRenderer(LOG_TYPE, (entry: any, { expanded }, theme: any) => {
+		const d = entry?.data as { level?: string; text?: string; at?: number } | undefined;
+		const level = d?.level ?? "info";
+		const color = level === "error" ? "error" : level === "warn" ? "warning" : "muted";
+		const label = level === "error" ? "ERROR" : level === "warn" ? "WARN" : "INFO";
+		const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
+		let text = `${theme.fg(color, `[watchdog ${label}]`)} ${d?.text ?? ""}`;
+		if (expanded && d?.at) {
+			text += `\n${theme.fg("dim", new Date(d.at).toLocaleTimeString())}`;
+		}
+		box.addChild(new Text(text, 0, 0));
+		return box;
+	});
+
+	// Tool `task_complete` — agent jím potvrdí, že je práce 100% hotová.
+	pi.registerTool({
+		name: "task_complete",
+		label: "Task complete",
+		description:
+			"Potvrď, že zadaný úkol je 100% hotový a ověřený — teprve pak zavolej tento tool. " +
+			"Ukončí automatické hlídání (watchdog). Nevolej, dokud nejsou splněny všechny " +
+			"požadavky zadání a ověřené (testy, build, běh).",
+		parameters: Type.Object({
+			summary: Type.Optional(
+				Type.String({ description: "Krátké shrnutí, co je hotové a jak je to ověřené." }),
+			),
+		}),
+		async execute(_toolCallId, params: any, _signal, _onUpdate, _ctx) {
+			try {
+				pi.appendEntry(TASK_COMPLETE_TYPE, {
+					summary: params?.summary ?? "",
+					at: Date.now(),
+				});
+			} catch {
+				/* ignore */
+			}
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Úkol označen jako 100% hotový. Watchdog ukončen.${params?.summary ? `\n\n${params.summary}` : ""}`,
+					},
+				],
+				details: { taskComplete: true },
+			};
+		},
+	});
 
 	// ---- TUI overlay přes /watchdog ---------------------------------------
 
@@ -320,6 +442,7 @@ export default function (pi: ExtensionAPI) {
 		};
 
 		// --- pravý sloupec, záložka Nastavení -------------------------------
+		const timeoutLabels = TIMEOUT_CHOICES.map((ms) => formatTimeout(Number(ms)));
 		const settingItems: SettingItem[] = [
 			{
 				id: "enabled",
@@ -331,7 +454,7 @@ export default function (pi: ExtensionAPI) {
 			{
 				id: "mode",
 				label: "Režim",
-				description: "smart = LLM směrování, simple = vždy jen '...'",
+				description: "smart = LLM směrování, simple = vždy jen nudge",
 				currentValue: cfg.mode,
 				values: ["smart", "simple"],
 			},
@@ -342,6 +465,13 @@ export default function (pi: ExtensionAPI) {
 				currentValue: String(cfg.max),
 				values: ["0", "3", "5", "10", "20", "50"],
 			},
+			{
+				id: "timeout",
+				label: "Timeout kontroly",
+				description: "jak dlouho smí běžet child pi při generování nasměrování",
+				currentValue: formatTimeout(cfg.timeout),
+				values: timeoutLabels,
+			},
 		];
 		const settingsList = new SettingsList(
 			settingItems,
@@ -351,6 +481,7 @@ export default function (pi: ExtensionAPI) {
 				if (id === "enabled") cfg.enabled = newValue === "on";
 				else if (id === "mode") cfg.mode = newValue as WatchdogMode;
 				else if (id === "max") cfg.max = Number(newValue) || 0;
+				else if (id === "timeout") cfg.timeout = parseTimeout(newValue);
 				saveConfig();
 				refreshStatus(ctx);
 				tui.requestRender();
@@ -471,12 +602,12 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("watchdog", {
-		description: "Nastavení watchdogu (modely, prompty, on/off, režim, max)",
+		description: "Nastavení watchdogu (modely, prompty, on/off, režim, max, timeout)",
 		handler: async (_args, ctx: any) => {
 			if (ctx.mode !== "tui") {
 				const skills = loadPromptSkills(promptsDir());
 				ctx.ui.notify(
-					`watchdog: ${cfg.enabled ? "on" : "off"}, mode=${cfg.mode}, model=${cfg.model}, max=${cfg.max}, prompt=${cfg.prompt || "(vestavěný)"}, promptů=${skills.length}`,
+					`watchdog: ${cfg.enabled ? "on" : "off"}, mode=${cfg.mode}, model=${cfg.model}, max=${cfg.max}, timeout=${formatTimeout(cfg.timeout)}, prompt=${cfg.prompt || "(vestavěný)"}, promptů=${skills.length}`,
 					"info",
 				);
 				return;
@@ -497,8 +628,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", async (_event, ctx) => {
 		const facts = collectFacts(ctx);
 		if (!facts) return; // ctx je nedostupný (reload / zavírání session)
+		const models = listModels(ctx);
 		setTimeout(() => {
-			void fire(facts);
+			void fire(facts, models);
 		}, 150);
 	});
 
@@ -508,6 +640,7 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			cfg = { ...DEFAULT_CONFIG };
 		}
+		count = 0; // nová session → nový rozpočet zásahů
 		refreshStatus(ctx);
 	});
 }

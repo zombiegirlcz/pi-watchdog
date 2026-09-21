@@ -9,6 +9,17 @@ import * as path from "node:path";
 /** V child procesu (které watchdog sám spouští) se démon neaktivuje → žádná rekurze. */
 export const CHILD_ENV = "PI_WATCHDOG_CHILD";
 export const CONFIG_TYPE = "pi-watchdog-config";
+/** Custom entry: agent potvrdil, že je práce 100% hotová (tool `task_complete`). */
+export const TASK_COMPLETE_TYPE = "pi-watchdog-task-complete";
+/** Custom message: rychlé šťouchnutí místo `...` — spustí nový LLM turn. */
+export const NUDGE_TYPE = "pi-watchdog-nudge";
+/** Custom message s vygenerovaným nasměrováním od child pi. */
+export const GUIDANCE_TYPE = "pi-watchdog-guidance";
+/** Custom entry: log viditelný v chatu, ale NEPOSÍLÁ se do LLM kontextu. */
+export const LOG_TYPE = "pi-watchdog-log";
+
+/** Text, který se pošle jako nudge (spustí nový turn s celým kontextem). */
+export const NUDGE_TEXT = "Pokračuj.";
 
 /** Název složky v balíčku, kde žijí uživatelské prompty (formát skillu). */
 export const PROMPTS_DIR_NAME = "prompts";
@@ -16,7 +27,7 @@ export const PROMPTS_DIR_NAME = "prompts";
 /**
  * Maximální velikost exportu session (ve znacích), který se posílá child pi.
  * Musí zůstat pod limitem shimu (~400000 znaků), jinak child vrátí
- * "Dosažen limit délky" a watchdog spadne na "...".
+ * "Dosažen limit délky" a watchdog spadne na nudge.
  */
 export const MAX_EXPORT_CHARS = 200000;
 
@@ -44,6 +55,8 @@ export interface WatchdogConfig {
 	max: number;
 	/** Název zvoleného prompt-skills z `prompts/`. Prázdné = vestavěný GUIDANCE_PROMPT. */
 	prompt: string;
+	/** Timeout (ms) na jednu kontrolu child pi. 0 = bez limitu. */
+	timeout: number;
 }
 
 export const DEFAULT_CONFIG: WatchdogConfig = {
@@ -52,7 +65,25 @@ export const DEFAULT_CONFIG: WatchdogConfig = {
 	model: "deepseek-free/deepseek-reasoner",
 	max: 20,
 	prompt: "",
+	timeout: 180000,
 };
+
+/** Možné hodnoty timeoutu pro picker (ms). */
+export const TIMEOUT_CHOICES = ["60000", "120000", "180000", "300000", "600000", "0"];
+
+/** Lidsky čitelný popisek timeoutu (pro picker). */
+export function formatTimeout(ms: number): string {
+	return ms > 0 ? `${Math.round(ms / 1000)}s` : "0 (bez limitu)";
+}
+
+/** Zpět z popisku na ms. Neznámý/nečitelný vstup → výchozí hodnota. */
+export function parseTimeout(label: string): number {
+	const t = (label ?? "").trim();
+	if (t.startsWith("0")) return 0;
+	const m = /^(\d+)\s*s?$/i.exec(t);
+	if (!m) return DEFAULT_CONFIG.timeout;
+	return Number(m[1]) * 1000;
+}
 
 /** Záložní seznam, když se modely nepodaří načíst z pi (mirror se plní za běhu). */
 export const MODEL_CHOICES = [
@@ -61,7 +92,7 @@ export const MODEL_CHOICES = [
 	"qwen-free/qwen3-coder",
 ];
 
-export type WatchdogAction = "none" | "dots" | "guidance";
+export type WatchdogAction = "none" | "nudge" | "guidance";
 
 export interface DecideInput {
 	enabled: boolean;
@@ -71,6 +102,8 @@ export interface DecideInput {
 	running: boolean;
 	isError: boolean;
 	lastWasWatchdog: boolean;
+	/** Agent zavolal `task_complete` → práce je 100% hotová, už nezasahovat. */
+	taskComplete: boolean;
 }
 
 /** Čisté rozhodnutí, co démon udělá. */
@@ -78,9 +111,12 @@ export function decide(i: DecideInput): WatchdogAction {
 	if (!i.enabled) return "none";
 	if (i.running) return "none";
 	if (i.mode === "off") return "none";
+	if (i.taskComplete) return "none"; // hotovo na 100 %, ukončit hlídání
 	if (i.max > 0 && i.count >= i.max) return "none";
-	if (i.mode === "simple" || i.isError) return "dots";
-	if (i.lastWasWatchdog) return "dots";
+	// `nudge` = znovu poslat request na API se stávajícím kontextem.
+	// `guidance` = nechat child pi vygenerovat konkrétní nasměrování.
+	if (i.mode === "simple" || i.isError) return "nudge";
+	if (i.lastWasWatchdog) return "nudge"; // agent na předchozí zásah nereagoval → šťouchnout
 	return "guidance";
 }
 
@@ -88,6 +124,12 @@ function messageOf(entry: unknown): any | undefined {
 	const e = entry as any;
 	if (e?.type !== "message" || !e.message) return undefined;
 	return e.message;
+}
+
+function entryOf(entry: unknown): any | undefined {
+	const e = entry as any;
+	if (e?.type === "custom") return e;
+	return undefined;
 }
 
 /** Projde session od konce a řekne, jestli poslední relevantní zpráva znamená chybu. */
@@ -106,16 +148,48 @@ export function lastIsError(entries: readonly unknown[]): boolean {
 	return false;
 }
 
-/** Byl poslední "lidský" vstup náš watchdog (a ne skutečný uživatel)? */
+/**
+ * Byl poslední "lidský" vstup náš watchdog A agent na něj ještě nereagoval?
+ * Jakmile po našem zásahu přijde assistant odpověď, vrací false — agent
+ * zareagoval, watchdog může znovu vyhodnotit stav (a případně poslat
+ * další, kvalifikovanější zásah).
+ */
 export function lastWasWatchdog(entries: readonly unknown[]): boolean {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const m = messageOf(entries[i]);
 		if (!m) continue;
 		if (m.role === "custom") {
-			if (m.customType === "pi-watchdog-guidance") return true;
+			if (m.customType === GUIDANCE_TYPE || m.customType === NUDGE_TYPE) return true;
 			continue;
 		}
+		if (m.role === "assistant") return false; // agent na náš vstup odpověděl
 		if (m.role === "user") return false;
+	}
+	return false;
+}
+
+/**
+ * Zavolal agent tool `task_complete` (a od té doby nepřišlo nové uživatelské
+ * zadání)? Pak je práce 100% hotová a watchdog se má ukončit.
+ */
+export function taskCompleted(entries: readonly unknown[]): boolean {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const e = entryOf(entries[i]);
+		if (e) {
+			if (e.customType === TASK_COMPLETE_TYPE) return true;
+			continue;
+		}
+		const m = messageOf(entries[i]);
+		if (!m) continue;
+		if (m.role === "custom") {
+			if (m.customType === TASK_COMPLETE_TYPE) return true;
+			continue;
+		}
+		// toolResult z toolu task_complete (kdyby custom entry chyběl)
+		if (m.role === "toolResult" && m.toolName === "task_complete") {
+			return m.isError !== true;
+		}
+		if (m.role === "user") return false; // nové zadání → hlídání znovu aktivní
 	}
 	return false;
 }
