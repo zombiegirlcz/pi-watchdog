@@ -3,6 +3,9 @@
  * Testovatelné samostatně přes node --experimental-strip-types.
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
+
 /** V child procesu (které watchdog sám spouští) se démon neaktivuje → žádná rekurze. */
 export const CHILD_ENV = "PI_WATCHDOG_CHILD";
 export const CONFIG_TYPE = "pi-watchdog-config";
@@ -214,6 +217,47 @@ export function stripFrontmatter(text: string): string {
  */
 export function pickSkillDirs(entries: readonly string[]): string[] {
 	return entries.filter((name) => !name.startsWith(".")).sort();
+}
+
+/** Načte prompt-skills z `prompts/<nazev>/SKILL.md` (formát skillu). */
+export function loadPromptSkills(dir: string): PromptSkill[] {
+	const out: PromptSkill[] = [];
+	let names: string[] = [];
+	try {
+		if (!fs.existsSync(dir)) return out;
+		names = pickSkillDirs(fs.readdirSync(dir));
+	} catch {
+		return out;
+	}
+	for (const name of names) {
+		const file = path.join(dir, name, "SKILL.md");
+		try {
+			if (!fs.existsSync(file)) continue;
+			const text = fs.readFileSync(file, "utf-8");
+			const fm = parseSkillFrontmatter(text);
+			out.push({
+				dir: name,
+				name: fm.name || name,
+				description: fm.description || "",
+				path: file,
+			});
+		} catch {
+			/* přeskoč rozbitý prompt */
+		}
+	}
+	return out;
+}
+
+/** Tělo zvoleného prompt-skills (nebo null, když není vybrán / nejde přečíst). */
+export function readPromptBody(skills: readonly PromptSkill[], chosen: string): string | null {
+	if (!chosen) return null;
+	const skill = skills.find((s) => s.dir === chosen || s.name === chosen);
+	if (!skill) return null;
+	try {
+		return stripFrontmatter(fs.readFileSync(skill.path, "utf-8"));
+	} catch {
+		return null;
+	}
 }
 
 /** Text, který se zapíše do prompt souboru pro child pi. */

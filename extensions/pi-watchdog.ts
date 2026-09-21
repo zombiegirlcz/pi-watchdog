@@ -58,8 +58,9 @@ import {
 	lastIsError,
 	lastWasWatchdog,
 	loadConfigFromEntries,
+	loadPromptSkills,
 	parseSkillFrontmatter,
-	pickSkillDirs,
+	readPromptBody,
 	sortModels,
 	stripFrontmatter,
 	tailByChars,
@@ -114,46 +115,7 @@ function promptsDir(): string {
 	return path.join(packageRoot(), PROMPTS_DIR_NAME);
 }
 
-/** Načte prompt-skills z `prompts/<nazev>/SKILL.md` (formát skillu). */
-function loadPromptSkills(dir: string): PromptSkill[] {
-	const out: PromptSkill[] = [];
-	let names: string[] = [];
-	try {
-		if (!fs.existsSync(dir)) return out;
-		names = pickSkillDirs(fs.readdirSync(dir));
-	} catch {
-		return out;
-	}
-	for (const name of names) {
-		const file = path.join(dir, name, "SKILL.md");
-		try {
-			if (!fs.existsSync(file)) continue;
-			const text = fs.readFileSync(file, "utf-8");
-			const fm = parseSkillFrontmatter(text);
-			out.push({
-				dir: name,
-				name: fm.name || name,
-				description: fm.description || "",
-				path: file,
-			});
-		} catch {
-			/* přeskoč rozbitý prompt */
-		}
-	}
-	return out;
-}
 
-/** Tělo zvoleného prompt-skills (nebo null, když není vybrán / nejde přečíst). */
-function readPromptBody(skills: readonly PromptSkill[], chosen: string): string | null {
-	if (!chosen) return null;
-	const skill = skills.find((s) => s.dir === chosen || s.name === chosen);
-	if (!skill) return null;
-	try {
-		return stripFrontmatter(fs.readFileSync(skill.path, "utf-8"));
-	} catch {
-		return null;
-	}
-}
 
 /** Mirror pi modelů: nejdřív ty s nakonfigurovaným auth, jinak celý katalog. */
 function listModels(ctx: any): ModelInfo[] {
